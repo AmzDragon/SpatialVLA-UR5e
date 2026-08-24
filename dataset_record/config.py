@@ -72,7 +72,7 @@ LEROBOT_FEATURES = {
 class RecordConfig:
     repo_id: str = ""
     robot_type: str = "ur5e_mujoco"
-    task: str = "teleoperate the UR5e arm in MuJoCo"
+    task: str = "Pick and place the yellow cylinder on the left side of the black rectangular paper. Then move the cyan cuboid under the red cube."
     dataset_root: Path = REPO_ROOT / "dataset_record" / "data" / "task1" / "bucket1_zero_completed1"
 
     xml_path: Path = REPO_ROOT / "description" / "desktop_scene.xml"
@@ -80,7 +80,53 @@ class RecordConfig:
     frame_type: str = "site"
     camera_names: tuple[str, str] = ("right_side_camera", "wrist_camera")
     image_feature_keys: tuple[str, str] = IMAGE_FEATURE_KEYS
+    camera_render_width: int = 640
+    camera_render_height: int = 480
     image_size: int = 224
+
+    spatial_episode_rd_enabled: bool = False
+    spatial_frame_rd_enabled: bool = False
+    appearance_rd_enabled: bool = False
+    rd_random_seed: int | None = None
+
+    external_camera_name: str = "right_side_camera"
+    episode_camera_translation_limit_m: float = 0.05
+    episode_camera_rotation_limit_deg: float = 5.0
+    frame_camera_translation_radius_m: float = 0.01
+    frame_camera_rotation_limit_deg: float = 1.0
+    frame_camera_change_interval_frames: tuple[int, int] = (25, 50)
+
+    table_geom_names: tuple[str, ...] = (
+        "table_top",
+        "table_surface",
+        "front_left_leg",
+        "front_right_leg",
+        "rear_left_leg",
+        "rear_right_leg",
+    )
+    table_color_change_interval_frames: tuple[int, int] = (25, 50)
+    table_color_palette: tuple[tuple[float, float, float, float], ...] = (
+        (0.34, 0.36, 0.40, 1.0),
+        (0.32, 0.22, 0.48, 1.0),
+        (0.46, 0.28, 0.56, 1.0),
+        (0.52, 0.30, 0.45, 1.0),
+        (0.12, 0.38, 0.18, 1.0),
+        (0.28, 0.40, 0.16, 1.0),
+        (0.20, 0.14, 0.42, 1.0),
+        (0.38, 0.29, 0.22, 1.0),
+        (0.25, 0.44, 0.30, 1.0),
+        (0.48, 0.36, 0.18, 1.0),
+    )
+    lighting_change_interval_frames: tuple[int, int] = (25, 50)
+    lighting_intensity_scale_range: tuple[float, float] = (0.60, 1.40)
+    lighting_rgb_jitter_limit: float = 0.08
+    floor_geom_name: str = "floor"
+    floor_material_names: tuple[str, ...] = (
+        "floor_wood",
+        "floor_concrete",
+        "floor_tiles",
+    )
+    floor_material_change_interval_frames: tuple[int, int] = (25, 50)
 
     fps: int = 30
     num_episodes: int = 10

@@ -112,6 +112,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-time-s", type=float, default=cfg.episode_time_s)
     parser.add_argument("--fps", type=int, default=cfg.fps)
     parser.add_argument(
+        "--spatial-episode-rd",
+        action="store_true",
+        help="Enable per-episode external-camera pose and table-height RD.",
+    )
+    parser.add_argument(
+        "--spatial-frame-rd",
+        action="store_true",
+        help="Enable per-frame external-camera pose RD.",
+    )
+    parser.add_argument(
+        "--appearance-rd",
+        action="store_true",
+        help=(
+            "Enable per-frame table-color, lighting, and floor-material RD."
+        ),
+    )
+    parser.add_argument(
         "--action-mode",
         choices=ACTION_MODES,
         default="theta",
@@ -131,6 +148,9 @@ def main() -> None:
         num_episodes=args.num_episodes,
         episode_time_s=args.episode_time_s,
         fps=args.fps,
+        spatial_episode_rd_enabled=args.spatial_episode_rd,
+        spatial_frame_rd_enabled=args.spatial_frame_rd,
+        appearance_rd_enabled=args.appearance_rd,
     )
 
     raw_episodes = collect_episodes(
@@ -477,12 +497,16 @@ def write_lerobot_dataset(
                 frame.update(state.images)
                 dataset.add_frame(frame)
             dataset.save_episode()
+            frame_domain_randomization = compress_frame_domain_randomization(
+                processed
+            )
             manifest_entries.append(
                 {
                     "episode_index": saved,
                     "description_id": raw_episode.description_id,
                     "task": raw_episode.task,
                     "env_info": raw_episode.env_info,
+                    "frame_domain_randomization": frame_domain_randomization,
                     "action_mode": action_mode,
                 }
             )
@@ -507,6 +531,31 @@ def write_lerobot_dataset(
     )
 
     return saved
+
+
+def compress_frame_domain_randomization(
+    processed: list[tuple[StateSample, np.ndarray]],
+) -> dict[str, list[dict[str, object]]]:
+    component_events: dict[str, list[dict[str, object]]] = {}
+    for component in (
+        "camera",
+        "table_color",
+        "lighting",
+        "floor_material",
+    ):
+        events = []
+        previous_state: object = object()
+        for frame_index, (sample, _) in enumerate(processed):
+            component_state = sample.domain_randomization.get(component)
+            if component_state is None or component_state == previous_state:
+                continue
+            event = {"frame_index": frame_index}
+            event.update(deepcopy(component_state))
+            events.append(event)
+            previous_state = component_state
+        if events:
+            component_events[component] = events
+    return component_events
 
 
 def process_episode(

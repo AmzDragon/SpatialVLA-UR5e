@@ -42,6 +42,9 @@ def replay_episode(*, root: Path, episode_index: int) -> None:
     manifest = load_manifest_entry(root, episode_index)
     actions = load_actions(root, info, episode, episode_index)
     action_mode = manifest.get("action_mode", "theta")
+    frame_rd_events = index_frame_domain_randomization_events(
+        manifest.get("frame_domain_randomization", {})
+    )
 
     cfg = replace(RecordConfig(), dataset_root=root, fps=int(info["fps"]))
     sim_env = LabSimMujocoEnv(cfg)
@@ -55,9 +58,18 @@ def replay_episode(*, root: Path, episode_index: int) -> None:
             sim_env.solver.reset_target_to_current()
             next_tick = time.perf_counter()
 
-            for action in actions:
+            current_frame_rd: dict[str, object] = {}
+            for frame_index, action in enumerate(actions):
                 if not viewer_is_running(viewer):
                     break
+                for component, state in frame_rd_events.get(
+                    frame_index, []
+                ):
+                    current_frame_rd[component] = state
+                if current_frame_rd:
+                    sim_env.apply_frame_domain_randomization_state(
+                        current_frame_rd
+                    )
                 execute_action(sim_env, action, action_mode)
                 viewer.sync()
                 next_tick += sim_env.control_dt
@@ -119,6 +131,10 @@ def execute_abs_action(sim_env: LabSimMujocoEnv, action: list[float]) -> None:
 
 
 def apply_env_info(sim_env: LabSimMujocoEnv, env_info: dict[str, Any]) -> None:
+    domain_randomization = env_info.get("domain_randomization")
+    if isinstance(domain_randomization, dict):
+        sim_env.apply_episode_domain_randomization_info(domain_randomization)
+
     for pose in env_info["objects"].values():
         sim_env.set_freejoint_pose(
             pose["freejoint"],
@@ -128,6 +144,29 @@ def apply_env_info(sim_env: LabSimMujocoEnv, env_info: dict[str, Any]) -> None:
     sim_env.data.qvel[:] = 0.0
     mujoco.mj_forward(sim_env.model, sim_env.data)
     sim_env.sync_solver_to_data()
+
+
+def index_frame_domain_randomization_events(
+    components: object,
+) -> dict[int, list[tuple[str, dict[str, object]]]]:
+    indexed: dict[int, list[tuple[str, dict[str, object]]]] = {}
+    if not isinstance(components, dict):
+        return indexed
+
+    for component, events in components.items():
+        if not isinstance(component, str) or not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict) or "frame_index" not in event:
+                continue
+            frame_index = int(event["frame_index"])
+            state = {
+                key: value
+                for key, value in event.items()
+                if key != "frame_index"
+            }
+            indexed.setdefault(frame_index, []).append((component, state))
+    return indexed
 
 
 def load_info(root: Path) -> dict[str, Any]:
