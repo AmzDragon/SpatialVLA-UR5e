@@ -1,27 +1,30 @@
 <div align="center">
 
-# vla-ur5e
+# vla-ur5e-sim2real
 
-面向 UR5e 桌面关系重排任务的 MuJoCo 仿真、数据采集与 VLA 微调工程
+面向 UR5e 桌面关系重排任务的 MuJoCo 仿真、Sim2Real、RTC 异步推理 VLA 工程
 
 ![Python](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white)
 ![MuJoCo](https://img.shields.io/badge/Simulator-MuJoCo-111111)
 ![mink](https://img.shields.io/badge/Solver-mink-6A5ACD)
 ![OpenPI](https://img.shields.io/badge/OpenPI-PI0.5%20LoRA-2E8B57)
-![GPU](https://img.shields.io/badge/GPU-%E2%89%A524GB-FF6B35)
+![RTDE](https://img.shields.io/badge/Control-RTDE%20125%20Hz-00897B)
+![RTC](https://img.shields.io/badge/Inference-RTC%20Async-1F6FEB)
+![GPU](https://img.shields.io/badge/GPU-%E2%89%A522GB-FF6B35)
+![License](https://img.shields.io/badge/License-Apache--2.0-D22128)
 
-识别物体、理解方位，让 VLA 在仿真桌面上完成语言条件操作任务。
+识别物体、理解方位，让 VLA 从仿真训练走向 UR5e 真机异步控制。
 
-[项目配置](#项目配置) | [项目介绍](#项目介绍) | [数据采集](#数据采集) | [数据处理与回放](#数据处理与回放) | [训练](#训练) | [推理](#推理)
+[项目配置](#项目配置) | [项目介绍](#项目介绍) | [数据采集](#数据采集) | [数据处理与回放](#数据处理与回放) | [训练](#训练) | [真机部署](#真机部署) | [许可证](#许可证)
 
 </div>
 
 ## 项目配置
 
-| 部分 | 用途 | 要求 |
-| --- | --- | --- |
-| 客户端 | MuJoCo 仿真、数据采集、数据回放、数据转换、请求 policy server | Python `>= 3.12`，`mink` 求解器 |
-| 服务端 | OpenPI 训练、归一化统计、启动 policy server | GPU 显存 `>= 24 GB` |
+| 部分 | 用途 |
+| --- | --- |
+| 客户端 | MuJoCo 仿真、数据采集、数据回放、数据转换与 RTC 请求、SharedMemoryRingBuffer 时间对齐与 RTDE 分层控制 |
+| 服务端 | OpenPI 训练、归一化统计与 RTC Policy Server |
 
 ### 客户端安装
 
@@ -53,7 +56,7 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 
 ## 项目介绍
 
-此项目是一个面向 UR5e 桌面操作任务的 VLA 训练工程，目标是让机器人不只是“看见”物体，而是能够把语言里的空间关系落到真实可执行的操作上。项目用 MuJoCo 构建可复现的仿真环境，通过自动化数据采集、数据回放、OpenPI 微调和在线推理，串起从任务描述到机器人动作的完整闭环。
+此项目首先面向 UR5e 真机上的语言条件推理与闭环控制：模型在 MuJoCo 中完成数据生成和训练，再通过 Sim2Real 部署到真实机器人，并由 RTC 异步推理与 RTDE 分层控制持续执行动作。目标是让机器人不只是“看见”物体，还能把语言中的空间关系稳定地落到真机操作上。
 
 这个项目关注的是 VLA 机器人操作中非常基础、也非常关键的一环：物体识别与方位理解。任务中包含不同颜色、形状和尺寸的物体，以及白色方形纸片、黑色矩形纸片等空间参照物。模型需要先判断“红色方块”“黄色圆柱”“青色长方体”分别在哪里，再理解 `left`、`right`、`up`、`down`、`center` 这类相对方位，最终完成由语言驱动的桌面关系重排。
 
@@ -97,6 +100,34 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 
 数据采集入口是 `dataset_record/record.py`，默认加载 `description/desktop_scene.xml`，并保存为 LeRobot 格式数据集。
 
+### 领域随机化
+
+<p align="center">
+  <img src="video/domain_randomization_front_views.jpg" width="900" alt="Five front-camera observations with all domain randomization enabled">
+  <br>
+  <sub>开启全部领域随机化后的 5 组前视相机观测</sub>
+</p>
+
+> 推荐论文：[Grounding Sim-to-Real Generalization in Robotic Manipulation: An Empirical Study with Vision-Language-Action Models](https://arxiv.org/abs/2603.22876)
+
+#### 论文结论与消融数据
+
+> **说明：以下描述和数据均来自上述论文，是对论文 Table 1 的整理，并非本项目的消融实验结果。**
+
+领域随机化很重要：它让模型不再依赖与任务无关的物体、环境和光照；**它不是为了让 Sim 长得像 Real，而是尽可能让 Real 推理数据的分布落在 Sim 训练数据分布之内。**
+
+根据论文 Table 1 对 5 项任务的真实环境成功率取平均，各项消融结果如下：
+
+| 随机化设置 | 论文真实环境平均成功率 | 相比Clean |
+| --- | ---: | ---: |
+| Clean（无随机化） | 7.2% | - |
+| Camera Pose（相机位姿） | 20.8% | +13.7 个百分点 |
+| Background（背景） | 15.4% | +8.3 个百分点 |
+| Lighting（光照） | 12.9% | +5.7 个百分点 |
+| Table Distractor（任务无关物体） | 8.4% | +1.2 个百分点 |
+
+从论文结果看，Camera Pose 的单项提升最大，Background 和 Lighting 次之，Table Distractor 单独使用的收益较小。这说明 VLA 对视角和空间关系的变化，比对单纯外观变化更敏感。
+
 ### 生成任务描述
 
 用于批量生成中英文任务描述和自动化采集所需的命令序列，输出到 `dataset_record/info/task1/task_descriptions.json`。自动化采集时，`record.py` 会通过 `--task-descriptions` 读取该文件。
@@ -105,37 +136,21 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 python dataset_record/task_description_generate.py
 ```
 
-### 键盘采集
-
-```bash
-python dataset_record/record.py \
-  --teleop keyboard \
-  --task "Move the red cube at the center of the black rectangular paper, then put the yellow cylinder under the cyan cuboid." \
-  --num-episodes 10 \
-  --episode-time-s 60 \
-  --overwrite
-```
-
 ### 自动化采集
+
+下面的命令会开启 episode 级空间随机化、frame 级空间随机化和外观随机化：
 
 ```bash
 python dataset_record/record.py \
   --teleop autoteleop \
   --task-descriptions dataset_record/info/task1/task_descriptions.json \
   --num-episodes 10 \
+  --spatial-episode-rd \
+  --spatial-frame-rd \
+  --appearance-rd \
   --headless \
   --overwrite
 ```
-
-常用控制：
-
-| 按键 | 功能 |
-| --- | --- |
-| 方向键 / PageUp / PageDown | 控制末端 XYZ 移动 |
-| `\` | 切换夹爪开合 |
-| Enter | 开始 / 结束当前 episode |
-| `R` | 丢弃当前 episode |
-| Esc | 停止采集 |
 
 ---
 
@@ -188,8 +203,6 @@ cd thirdparty/openpi
 指定训练数据集并计算归一化统计，注意这里使用lerobot_dataset v21格式数据集：
 
 ```bash
-export OPENPI_UR5E_DATASET_ROOT="$PWD/../../dataset_record/data/task1/bucket1_zero_completed1_v21"
-
 uv run scripts/compute_norm_stats.py \
   --config-name pi05_ur5e_lora
 ```
@@ -212,11 +225,79 @@ thirdparty/openpi/checkpoints/pi05_ur5e_lora/ur5e_lora/<step>/
 
 ---
 
-## 推理
+## 真机部署
 
-推理分为两端：OpenPI policy server 负责跑模型，`vla-ur5e` client 负责从 MuJoCo 采集观测、发送 WebSocket 请求并执行返回动作。
+真机端将双 RealSense、UR5e 与夹爪状态按时间戳组装为 VLA observation；OpenPI 在服务端异步生成 action chunk，RTC 在 30 Hz 控制时间线上衔接动作，RTDE 控制层再将末端目标展开为 125 Hz 的机器人指令。
 
-### 启动服务端
+<p align="center">
+  <img src="video/01_real_inference_overview.png" width="1000" alt="UR5e real-world VLA inference overview">
+</p>
+
+### SharedMemoryRingBuffer：感知与时间对齐
+
+双 RealSense、机器人状态和夹爪状态分别由独立数据源写入共享内存环形缓冲区，并为每条数据记录主机接收时间。发起推理时，以 `t_anchor` 为统一时间锚点，从每个 RingBuffer 中选择“不晚于锚点的最新样本”，避免把未来状态和过去图像错误地拼成同一帧观测。
+
+<p align="center">
+  <img src="video/02_shared_memory_ring_buffer.png" width="820" alt="SharedMemoryRingBuffer data flow">
+</p>
+
+| 参数 | 设定 | 作用 |
+| --- | ---: | --- |
+| RealSense 图像 | `640 × 480 RGB @ 60 Hz` | 前视与腕部视觉输入 |
+| UR5e 状态 | `125 Hz` | TCP / joints 状态反馈 |
+| 夹爪状态 | `20 Hz` | 串口读取开合状态 |
+| RingBuffer 时间窗口 | `1 s` | 保留各数据源的近期样本 |
+| 对齐规则 | `latest_not_after(t_anchor)` | 生成因果一致的 VLA observation |
+
+### RTDE + IK + ServoJ：分层闭环控制
+
+RTC 输出的 30 Hz action 先积分为末端位姿目标，再插值到 125 Hz。每个插值目标使用上一合法关节状态作为 IK 初值，并通过 FK 回代误差与关节连续性检查；首次失败时将插值步长缩小为原来的 `3/4` 后重试，仍不合法则取消当前 action 的剩余插值并保持上一合法关节目标。
+
+<p align="center">
+  <img src="video/03_rtde_ik_servoj.png" width="820" alt="RTDE IK and ServoJ control flow">
+</p>
+
+| 参数 | 设定 |
+| --- | ---: |
+| Action 输入频率 | `30 Hz` |
+| RTDE 控制频率 | `125 Hz`（`8 ms / step`） |
+| FK 位置误差 | `≤ 1 mm` |
+| FK 姿态旋转角误差 | `≤ 2°` |
+| 最大关节速度 | `≤ 1.5 rad/s` |
+| IK 重试步长 | 当前插值步长的 `3/4` |
+| 机器人控制模式 | `ServoJ` |
+
+### RTC：异步推理与动作块衔接
+
+RTC 将 OpenPI 推理放到后台线程中，控制主线程继续消费当前动作队列。队列剩余不超过阈值且没有未完成请求时，客户端采集新 observation，并把上一动作块、预测延迟和 execution horizon 一并发送；新 chunk 返回后跳过推理期间已经消耗的前缀，再接管剩余控制时间线。
+
+<p align="center">
+  <img src="video/04_rtc_detail.png" width="820" alt="RTC asynchronous inference and action chunk handoff">
+</p>
+
+| 参数 | 设定 | 作用 |
+| --- | ---: | --- |
+| 控制频率 | `30 Hz` | 连续消费 RTCActionQueue |
+| Action horizon | `50 steps` | OpenPI 每次返回的动作块长度 |
+| Queue threshold | `25 steps` | 触发下一次异步推理 |
+| Warmup inferences | `10` | 建立初始延迟统计 |
+| 延迟窗口 | 最近 `20` 次 | 使用 `P95 + 1 step` 预测 `d_pred` |
+| Execution horizon | `max(0, 15 - d_pred)` | 控制新旧动作块的前缀衔接 |
+| Network timeout | `120 s` | RTC 推理请求超时 |
+
+### 部署参数
+
+启动前按实际设备重新设置以下参数：
+
+| 参数 | 代码位置 | 设置内容 |
+| --- | --- | --- |
+| Policy Server 地址 | `inference/client.py`：`DEFAULT_HOST`、`DEFAULT_PORT` | 服务端局域网 IP 与 `8088` 端口 |
+| UR5e 地址 | `inference/realworld/shared_memory_state_collector.py`：`REALWORLD_ROBOT_IP` | 真机控制柜 IP |
+| RealSense 序列号 | `inference/realworld/real_inference.py`：`cameras` | 前视与腕部相机序列号 |
+| 夹爪串口 | `inference/realworld/shared_memory_state_collector.py`：`SERIAL_GRIPPER_PORT` | 例如 `/dev/ttyUSB0` |
+| 任务指令 | `inference/realworld/shared_memory_state_collector.py`：`REALWORLD_PROMPT` | 当前真机任务的英文描述 |
+
+### 启动 RTC 服务端
 
 ```bash
 cd thirdparty/openpi
@@ -224,18 +305,22 @@ cd thirdparty/openpi
 uv run scripts/serve_policy.py policy:checkpoint \
   --policy.config=pi05_ur5e_lora \
   --policy.dir=checkpoints/pi05_ur5e_lora/ur5e_lora/<step> \
-  --port=8088
+  --port=8088 \
+  --rtc
 ```
 
-### 启动客户端
+### 启动真机客户端
+
+确认 UR5e 工作区内无人、急停可用且设备参数已经核对，再启动真机控制：
 
 ```bash
-python inference/client.py \
-  --host <policy_server_ip> \
-  --port 8088 \
-  --prompt "Pick and place the yellow cylinder on the left side of the black rectangular paper." \
-  --num-chunks 1000 \
-  --execution-horizon 25
+python inference/realworld/real_inference.py
 ```
 
-客户端发送的 observation 包含 `observation.state`、两路 RGB 图像和 `prompt`。服务端返回 `actions`，客户端按 chunk 执行动作：前三维作为末端 XYZ 增量，第七维按阈值解释为夹爪开合。
+按 `Ctrl+C` 停止 rollout。运行日志、观测快照和动作记录保存在 `inference/realworld/logs/<timestamp>/`。
+
+---
+
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE)。仓库中的第三方依赖和 Git submodule 继续遵循各自的许可证。
