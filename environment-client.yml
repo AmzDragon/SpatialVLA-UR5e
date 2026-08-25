@@ -19,8 +19,10 @@ dependencies:
       - pandas==2.3.3
       - pillow==12.2.0
       - pyarrow==24.0.0
+      - pyserial==3.5
       - torch==2.11.0
       - torchcodec==0.11.1
       - torchvision==0.26.0
+      - ur-rtde
       - websockets==16.0
       - -e ./thirdparty/lerobot[dataset]

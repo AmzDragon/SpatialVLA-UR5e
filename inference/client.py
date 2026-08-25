@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import websockets.sync.client
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +23,7 @@ for import_path in (REPO_ROOT, OPENPI_CLIENT_SRC):
 
 from dataset_record.config import EXTERIOR_IMAGE_KEY, WRIST_IMAGE_KEY, RecordConfig
 from env import LabSimMujocoEnv, StateSample, viewer_is_running
-from openpi_client import image_tools, websocket_client_policy
+from openpi_client import image_tools, msgpack_numpy, websocket_client_policy
 
 
 STATE_KEY = "observation.state"
@@ -35,6 +36,54 @@ DEFAULT_NUM_CHUNKS = 1000
 
 DEFAULT_HOST = "10.21.22.46"
 DEFAULT_PORT = 8088
+NETWORK_TIMEOUT_S = 2.0
+
+
+class _TimeoutWebsocketClientPolicy(websocket_client_policy.WebsocketClientPolicy):
+    """OpenPI websocket policy with bounded connect and inference waits."""
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int | None = None,
+        api_key: str | None = None,
+        *,
+        timeout_s: float = NETWORK_TIMEOUT_S,
+    ) -> None:
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
+        self._timeout_s = float(timeout_s)
+        super().__init__(host=host, port=port, api_key=api_key)
+
+    def _wait_for_server(self):
+        headers = (
+            {"Authorization": f"Api-Key {self._api_key}"}
+            if self._api_key
+            else None
+        )
+        connection = websockets.sync.client.connect(
+            self._uri,
+            compression=None,
+            max_size=None,
+            additional_headers=headers,
+            open_timeout=self._timeout_s,
+            close_timeout=self._timeout_s,
+        )
+        try:
+            metadata = msgpack_numpy.unpackb(
+                connection.recv(timeout=self._timeout_s)
+            )
+        except BaseException:
+            connection.close()
+            raise
+        return connection, metadata
+
+    def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
+        self._ws.send(self._packer.pack(observation))
+        response = self._ws.recv(timeout=self._timeout_s)
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack_numpy.unpackb(response)
 
 
 def build_ur5e_observation(
@@ -94,12 +143,14 @@ class RemoteUR5EInferenceClient:
         port: int | None = DEFAULT_PORT,
         api_key: str | None = None,
         image_size: int = 224,
+        timeout_s: float = NETWORK_TIMEOUT_S,
     ) -> None:
         self.image_size = image_size
-        self._policy = websocket_client_policy.WebsocketClientPolicy(
+        self._policy = _TimeoutWebsocketClientPolicy(
             host=host,
             port=port,
             api_key=api_key,
+            timeout_s=timeout_s,
         )
 
     def infer_action_chunk_from_env(
@@ -130,6 +181,17 @@ class RemoteUR5EInferenceClient:
         )
         return self.infer_action_chunk(observation)
 
+    def infer_action_chunk_from_collector(
+        self,
+        collector: Any,
+        *,
+        prompt: str,
+        anchor_timestamp: float | None = None,
+    ) -> np.ndarray:
+        """Capture one causally aligned real-world sample and run pi0.5."""
+        state_sample = collector.get_observation(anchor_timestamp)
+        return self.infer_action_chunk_from_sample(state_sample, prompt=prompt)
+
     def infer_action_chunk(self, observation: dict[str, Any]) -> np.ndarray:
         result = self._policy.infer(observation)
         if ACTION_KEY not in result:
@@ -138,6 +200,13 @@ class RemoteUR5EInferenceClient:
             )
 
         action_chunk = np.asarray(result[ACTION_KEY], dtype=np.float32)
+        if action_chunk.ndim != 2 or action_chunk.shape[1] != ACTION_DIM:
+            raise ValueError(
+                f"expected {ACTION_KEY!r} shape (T, {ACTION_DIM}), "
+                f"got {action_chunk.shape}"
+            )
+        if action_chunk.shape[0] == 0:
+            raise ValueError("policy returned an empty action chunk")
         return action_chunk
 
     def rollout(
@@ -178,6 +247,21 @@ class RemoteUR5EInferenceClient:
 
     def reset(self) -> None:
         self._policy.reset()
+
+    @property
+    def server_metadata(self) -> dict[str, Any]:
+        return self._policy.get_server_metadata()
+
+    def close(self) -> None:
+        websocket = getattr(self._policy, "_ws", None)
+        if websocket is not None:
+            websocket.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
 
 def execute_action_steps(
@@ -248,6 +332,11 @@ def _as_image(image: Any, *, image_size: int) -> np.ndarray:
         raise ValueError(f"expected RGB image with 3 channels, got {image_array.shape}")
 
     image_array = image_tools.convert_to_uint8(image_array)
+    height, width = image_array.shape[:2]
+    crop_size = min(height, width)
+    top = (height - crop_size) // 2
+    left = (width - crop_size) // 2
+    image_array = image_array[top : top + crop_size, left : left + crop_size]
     image_array = image_tools.resize_with_pad(image_array, image_size, image_size)
     return np.ascontiguousarray(image_array)
 
