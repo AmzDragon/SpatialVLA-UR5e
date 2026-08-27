@@ -15,7 +15,8 @@
 
 识别物体、理解方位，让 VLA 从仿真训练走向 UR5e 真机异步控制。
 
-[项目配置](#项目配置) | [项目介绍](#项目介绍) | [数据采集](#数据采集) | [数据处理与回放](#数据处理与回放) | [训练](#训练) | [真机部署](#真机部署) | [许可证](#许可证)
+[项目配置](#项目配置) | [项目介绍](#项目介绍) | [数据采集](#数据采集) | [数据处理与回放](#数据处理与回放) | [训练](#训练) | [真机部署](#真机部署) | [许可证](#许可证)<br>
+[仿真 GIF](#仿真-gif) | [真机推理 GIF](#真机推理-gif)
 
 </div>
 
@@ -73,7 +74,7 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
   <img src="video/task%20description.png" width="900" alt="vla-ur5e task description">
 </p>
 
-### 演示 GIF
+### 仿真 GIF
 
 <table>
   <tr>
@@ -93,6 +94,14 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
     </td>
   </tr>
 </table>
+
+### 真机推理 GIF
+
+<p align="center">
+  <img src="video/real_inference.gif" width="720" alt="UR5e real-world VLA inference">
+  <br>
+  <sub>指令：Transfer the red cube below the cyan cuboid, then carry the yellow cylinder in the centre of the black rectangular paper.</sub>
+</p>
 
 ---
 
@@ -231,14 +240,6 @@ thirdparty/openpi/checkpoints/pi05_ur5e_lora/ur5e_lora/<step>/
 
 <p align="center">
   <img src="video/01_real_inference_overview.png" width="1000" alt="UR5e real-world VLA inference overview">
-</p>
-
-### 真机推理演示
-
-<p align="center">
-  <img src="video/real_inference.gif" width="720" alt="UR5e real-world VLA inference">
-  <br>
-  <sub>指令：Transfer the red cube below the cyan cuboid, then carry the yellow cylinder in the centre of the black rectangular paper.</sub>
 </p>
 
 ### SharedMemoryRingBuffer：感知与时间对齐
