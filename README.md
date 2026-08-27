@@ -233,6 +233,16 @@ thirdparty/openpi/checkpoints/pi05_ur5e_lora/ur5e_lora/<step>/
   <img src="video/01_real_inference_overview.png" width="1000" alt="UR5e real-world VLA inference overview">
 </p>
 
+### 真机推理演示
+
+<p align="center">
+  <a href="video/real_inference.mp4">
+    <img src="video/real_world_inference_from_02m00s_poster.jpg" width="820" alt="UR5e real-world VLA inference video">
+  </a>
+  <br>
+  <sub>指令：Transfer the red cube below the cyan cuboid, then carry the yellow cylinder in the centre of the black rectangular paper.</sub>
+</p>
+
 ### SharedMemoryRingBuffer：感知与时间对齐
 
 双 RealSense、机器人状态和夹爪状态分别由独立数据源写入共享内存环形缓冲区，并为每条数据记录主机接收时间。发起推理时，以 `t_anchor` 为统一时间锚点，从每个 RingBuffer 中选择“不晚于锚点的最新样本”，避免把未来状态和过去图像错误地拼成同一帧观测。
