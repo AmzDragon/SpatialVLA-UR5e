@@ -236,9 +236,7 @@ thirdparty/openpi/checkpoints/pi05_ur5e_lora/ur5e_lora/<step>/
 ### 真机推理演示
 
 <p align="center">
-  <a href="video/real_inference.mp4">
-    <img src="video/real_world_inference_from_02m00s_poster.jpg" width="820" alt="UR5e real-world VLA inference video">
-  </a>
+  <img src="video/real_inference.gif" width="720" alt="UR5e real-world VLA inference">
   <br>
   <sub>指令：Transfer the red cube below the cyan cuboid, then carry the yellow cylinder in the centre of the black rectangular paper.</sub>
 </p>
