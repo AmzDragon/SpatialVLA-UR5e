@@ -238,61 +238,18 @@ thirdparty/openpi/checkpoints/pi05_ur5e_lora/ur5e_lora/<step>/
 
 真机端将双 RealSense、UR5e 与夹爪状态按时间戳组装为 VLA observation；OpenPI 在服务端异步生成 action chunk，RTC 在 30 Hz 控制时间线上衔接动作，RTDE 控制层再将末端目标展开为 125 Hz 的机器人指令。
 
-<p align="center">
-  <img src="video/01_real_inference_overview.png" width="1000" alt="UR5e real-world VLA inference overview">
-</p>
-
 ### SharedMemoryRingBuffer：感知与时间对齐
 
 双 RealSense、机器人状态和夹爪状态分别由独立数据源写入共享内存环形缓冲区，并为每条数据记录主机接收时间。发起推理时，以 `t_anchor` 为统一时间锚点，从每个 RingBuffer 中选择“不晚于锚点的最新样本”，避免把未来状态和过去图像错误地拼成同一帧观测。
 
-<p align="center">
-  <img src="video/02_shared_memory_ring_buffer.png" width="820" alt="SharedMemoryRingBuffer data flow">
-</p>
-
-| 参数 | 设定 | 作用 |
-| --- | ---: | --- |
-| RealSense 图像 | `640 × 480 RGB @ 60 Hz` | 前视与腕部视觉输入 |
-| UR5e 状态 | `125 Hz` | TCP / joints 状态反馈 |
-| 夹爪状态 | `20 Hz` | 串口读取开合状态 |
-| RingBuffer 时间窗口 | `1 s` | 保留各数据源的近期样本 |
-| 对齐规则 | `latest_not_after(t_anchor)` | 生成因果一致的 VLA observation |
 
 ### RTDE + IK + ServoJ：分层闭环控制
 
 RTC 输出的 30 Hz action 先积分为末端位姿目标，再插值到 125 Hz。每个插值目标使用上一合法关节状态作为 IK 初值，并通过 FK 回代误差与关节连续性检查；首次失败时将插值步长缩小为原来的 `3/4` 后重试，仍不合法则取消当前 action 的剩余插值并保持上一合法关节目标。
 
-<p align="center">
-  <img src="video/03_rtde_ik_servoj.png" width="820" alt="RTDE IK and ServoJ control flow">
-</p>
-
-| 参数 | 设定 |
-| --- | ---: |
-| Action 输入频率 | `30 Hz` |
-| RTDE 控制频率 | `125 Hz`（`8 ms / step`） |
-| FK 位置误差 | `≤ 1 mm` |
-| FK 姿态旋转角误差 | `≤ 2°` |
-| 最大关节速度 | `≤ 1.5 rad/s` |
-| IK 重试步长 | 当前插值步长的 `3/4` |
-| 机器人控制模式 | `ServoJ` |
-
 ### RTC：异步推理与动作块衔接
 
 RTC 将 OpenPI 推理放到后台线程中，控制主线程继续消费当前动作队列。队列剩余不超过阈值且没有未完成请求时，客户端采集新 observation，并把上一动作块、预测延迟和 execution horizon 一并发送；新 chunk 返回后跳过推理期间已经消耗的前缀，再接管剩余控制时间线。
-
-<p align="center">
-  <img src="video/04_rtc_detail.png" width="820" alt="RTC asynchronous inference and action chunk handoff">
-</p>
-
-| 参数 | 设定 | 作用 |
-| --- | ---: | --- |
-| 控制频率 | `30 Hz` | 连续消费 RTCActionQueue |
-| Action horizon | `50 steps` | OpenPI 每次返回的动作块长度 |
-| Queue threshold | `25 steps` | 触发下一次异步推理 |
-| Warmup inferences | `10` | 建立初始延迟统计 |
-| 延迟窗口 | 最近 `20` 次 | 使用 `P95 + 1 step` 预测 `d_pred` |
-| Execution horizon | `max(0, 15 - d_pred)` | 控制新旧动作块的前缀衔接 |
-| Network timeout | `120 s` | RTC 推理请求超时 |
 
 ### 部署参数
 
