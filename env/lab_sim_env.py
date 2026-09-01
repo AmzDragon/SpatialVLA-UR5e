@@ -6,12 +6,25 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import cv2
 import mujoco
 import mujoco.viewer
 import numpy as np
 
 from dataset_record.config import RecordConfig
+from env.domain_randomization import DomainRandomizer
 from teleop.mink_ik_solver import MinkIKSolver
+
+
+def _center_crop_square(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    crop_size = min(height, width)
+    crop_top = (height - crop_size) // 2
+    crop_left = (width - crop_size) // 2
+    return image[
+        crop_top : crop_top + crop_size,
+        crop_left : crop_left + crop_size,
+    ]
 
 
 @dataclass
@@ -19,6 +32,7 @@ class StateSample:
     state: np.ndarray
     rotation_matrix: np.ndarray
     images: dict[str, np.ndarray] = field(default_factory=dict)
+    domain_randomization: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.state = self.state.astype(np.float32, copy=False)
@@ -50,11 +64,12 @@ class LabSimMujocoEnv:
         self.initial_ctrl = cfg.initial_ctrl_array()
         self.gripper_closed = self.initial_gripper_closed
         self.rng = np.random.default_rng(cfg.reset_random_seed)
+        self.domain_randomizer = DomainRandomizer(self.model, cfg)
         self.renderers = {
             camera_name: mujoco.Renderer(
                 self.model,
-                height=cfg.image_size,
-                width=cfg.image_size,
+                height=cfg.camera_render_height,
+                width=cfg.camera_render_width,
             )
             for camera_name in cfg.camera_names
         }
@@ -68,6 +83,7 @@ class LabSimMujocoEnv:
         return bool(self.initial_ctrl[-1] > self.cfg.gripper_closed_eps)
 
     def reset(self) -> None:
+        self.domain_randomizer.reset_episode()
         mujoco.mj_resetData(self.model, self.data)
         self.initialize_from_ctrl(self.initial_ctrl)
         self.gripper_closed = self.initial_gripper_closed
@@ -124,7 +140,12 @@ class LabSimMujocoEnv:
                 return tuple(
                     (
                         spec.name,
-                        (x, y, spec.z, *spec.rotation_rpy),
+                        (
+                            x,
+                            y,
+                            spec.z,
+                            *spec.rotation_rpy,
+                        ),
                     )
                     for spec, x, y in placements
                 )
@@ -176,7 +197,22 @@ class LabSimMujocoEnv:
                 spec.name: self.capture_object_pose(spec.name)
                 for spec in self.cfg.reset_objects
             },
+            "domain_randomization": (
+                self.domain_randomizer.capture_episode_info()
+            ),
         }
+
+    def apply_episode_domain_randomization_info(
+        self,
+        info: dict[str, object],
+    ) -> None:
+        self.domain_randomizer.apply_episode_info(info)
+
+    def apply_frame_domain_randomization_state(
+        self,
+        state: dict[str, object],
+    ) -> None:
+        self.domain_randomizer.apply_frame_state(state)
 
     def capture_object_pose(self, object_name: str) -> dict[str, object]:
         joint_name = f"{object_name}_freejoint"
@@ -336,6 +372,7 @@ class LabSimMujocoEnv:
             mujoco.mj_step(self.model, self.data)
 
     def capture_state(self, *, gripper_closed: bool | None = None) -> StateSample:
+        self.domain_randomizer.prepare_frame()
         site_id = mujoco.mj_name2id(
             self.model,
             mujoco.mjtObj.mjOBJ_SITE,
@@ -357,6 +394,9 @@ class LabSimMujocoEnv:
             state=state,
             rotation_matrix=rotation_matrix,
             images=self.render_images(),
+            domain_randomization=(
+                self.domain_randomizer.capture_frame_state()
+            ),
         )
 
     def render_images(self) -> dict[str, np.ndarray]:
@@ -368,7 +408,13 @@ class LabSimMujocoEnv:
         ):
             renderer = self.renderers[camera_name]
             renderer.update_scene(self.data, camera=camera_name)
-            images[feature_key] = renderer.render().astype(np.uint8, copy=False).copy()
+            rendered = renderer.render().astype(np.uint8, copy=False)
+            cropped = _center_crop_square(rendered)
+            images[feature_key] = cv2.resize(
+                cropped,
+                (self.cfg.image_size, self.cfg.image_size),
+                interpolation=cv2.INTER_AREA,
+            )
         return images
 
     def viewer_context(self, *, headless: bool = False):
