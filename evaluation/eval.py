@@ -1,22 +1,14 @@
-"""Evaluate final positions of two-stage UR5e tabletop rearrangement rollouts.
-
-The independent suite uses A->B/C->D tasks from the existing recording task
-file.  The chained suite generates A->B/C->A tasks.  After the rollout ends,
-each subtask is judged only by the planar distance between its source center
-site and requested MuJoCo relation site.
-"""
+"""Run the fixed 60+60 independent and chained evaluation suite."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, replace
 import json
-import random
+from pathlib import Path
 import sys
 import time
-from dataclasses import asdict, dataclass, replace
-from itertools import permutations, product
-from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -27,482 +19,359 @@ if str(REPO_ROOT) not in sys.path:
 
 from dataset_record.config import RecordConfig
 from env import LabSimMujocoEnv, viewer_is_running
+from evaluation.cases import load_or_create_cases
 from evaluation.config import EvaluationConfig
-from teleop.automated_teleop import MOVABLE_OBJECTS, PickPlaceCommand
+from evaluation.scene import EvaluationScene
 
 
-ALL_OBJECTS = (
-    "red_cube",
-    "yellow_cylinder",
-    "cyan_cuboid",
-    "white_square_sheet",
-    "black_rectangular_sheet",
-)
-SHEET_OBJECTS = frozenset({"white_square_sheet", "black_rectangular_sheet"})
-POSITIONS = ("up", "down", "left", "right", "center")
-NON_CENTER_POSITIONS = ("up", "down", "left", "right")
-MOVABLE_OBJECT_NAMES = tuple(sorted(MOVABLE_OBJECTS))
-
-DISPLAY_NAMES = {
-    "red_cube": "red cube",
-    "yellow_cylinder": "yellow cylinder",
-    "cyan_cuboid": "cyan cuboid",
-    "white_square_sheet": "white square paper",
-    "black_rectangular_sheet": "black rectangular paper",
-}
-RELATION_PHRASES = {
-    "up": "above",
-    "down": "below",
-    "left": "to the left of",
-    "right": "to the right of",
-    "center": "at the center of",
-}
+def relation_error(env: LabSimMujocoEnv, command: dict[str, str]) -> float:
+    source = env.get_site_position(f"{command['source_object']}_center_site")
+    destination = env.get_site_position(
+        f"{command['target_object']}_{command['target_position']}_site"
+    )
+    return float(np.linalg.norm(source[:2] - destination[:2]))
 
 
-@dataclass(frozen=True)
-class EvaluationTask:
-    task_id: str
-    suite: str
-    prompt: str
-    commands: tuple[PickPlaceCommand, PickPlaceCommand]
-
-
-@dataclass
-class EpisodeResult:
-    task_id: str
-    suite: str
-    prompt: str
-    commands: list[dict[str, str]]
-    subtasks: list[dict[str, Any]]
-    subtask_1_success: bool
-    subtask_2_success: bool
-    double_stage_success: bool
-    final_relation_errors_m: list[float]
-    chunks: int
-    steps: int
-    termination: str
-    initial_env_info: dict[str, object]
-    final_env_info: dict[str, object]
-    error: str | None = None
-
-
-def relation_error(
-    env: LabSimMujocoEnv,
-    command: PickPlaceCommand,
-) -> float:
-    """Return final XY distance from source center to the requested relation site."""
-    source_position = env.get_site_position(command.source_site)
-    destination_position = env.get_site_position(command.destination_site)
-    return float(np.linalg.norm(source_position[:2] - destination_position[:2]))
-
-
-def load_independent_tasks(path: Path) -> list[EvaluationTask]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    items = payload.get("descriptions")
-    if not isinstance(items, list):
-        raise ValueError(f"task file has no 'descriptions' list: {path}")
-
-    tasks = []
-    for index, item in enumerate(items):
-        if not isinstance(item, dict):
-            raise ValueError(f"description {index} must be an object")
-        command_items = item.get("commands")
-        if not isinstance(command_items, list) or len(command_items) != 2:
-            continue
-        try:
-            commands = tuple(PickPlaceCommand(**command) for command in command_items)
-        except TypeError as exc:
-            raise ValueError(f"invalid command in description {index}") from exc
-        for command in commands:
-            _validate_command(command, description_index=index)
-
-        first_objects = {commands[0].source_object, commands[0].target_object}
-        second_objects = {commands[1].source_object, commands[1].target_object}
-        if not first_objects.isdisjoint(second_objects):
-            continue
-
-        task_id = item.get("id", f"independent_{index + 1:03d}")
-        prompt = item.get("english")
-        if not isinstance(task_id, str) or not isinstance(prompt, str):
-            raise ValueError(f"description {index} has an invalid id or English prompt")
-        tasks.append(
-            EvaluationTask(
-                task_id=task_id,
-                suite="independent",
-                prompt=prompt,
-                commands=(commands[0], commands[1]),
-            )
-        )
-
-    if not tasks:
-        raise ValueError(f"no independent two-stage tasks found in {path}")
-    return tasks
-
-
-def _validate_command(
-    command: PickPlaceCommand,
-    *,
-    description_index: int,
-) -> None:
-    if command.source_object not in MOVABLE_OBJECTS:
-        raise ValueError(
-            f"description {description_index} has a non-graspable source: "
-            f"{command.source_object}"
-        )
-    if command.target_object not in ALL_OBJECTS:
-        raise ValueError(
-            f"description {description_index} has an unknown target: "
-            f"{command.target_object}"
-        )
-    if command.source_object == command.target_object:
-        raise ValueError(
-            f"description {description_index} uses the same source and target"
-        )
-    if command.target_position not in POSITIONS:
-        raise ValueError(
-            f"description {description_index} has an unknown relation: "
-            f"{command.target_position}"
-        )
-    if (
-        command.target_position == "center"
-        and command.target_object not in SHEET_OBJECTS
-    ):
-        raise ValueError(
-            f"description {description_index} centers an object on a non-sheet target"
-        )
-
-
-def generate_chained_tasks(seed: int) -> list[EvaluationTask]:
-    """Generate A->B then C->A tasks, where A, B and C are distinct."""
-    scenarios: list[tuple[PickPlaceCommand, PickPlaceCommand]] = []
-    for source_a, source_c in permutations(MOVABLE_OBJECT_NAMES, 2):
-        target_candidates = (
-            object_name
-            for object_name in ALL_OBJECTS
-            if object_name not in {source_a, source_c}
-        )
-        for target_b in target_candidates:
-            first_positions = (
-                POSITIONS if target_b in SHEET_OBJECTS else NON_CENTER_POSITIONS
-            )
-            for first_position, second_position in product(
-                first_positions,
-                NON_CENTER_POSITIONS,
-            ):
-                scenarios.append(
-                    (
-                        PickPlaceCommand(source_a, target_b, first_position),
-                        PickPlaceCommand(source_c, source_a, second_position),
-                    )
-                )
-
-    random.Random(seed).shuffle(scenarios)
-    return [
-        EvaluationTask(
-            task_id=f"chained_{index + 1:03d}",
-            suite="chained",
-            prompt=_render_prompt(commands),
-            commands=commands,
-        )
-        for index, commands in enumerate(scenarios)
-    ]
-
-
-def _render_prompt(
-    commands: tuple[PickPlaceCommand, PickPlaceCommand],
-) -> str:
-    clauses = []
-    for command in commands:
-        clauses.append(
-            f"place the {DISPLAY_NAMES[command.source_object]} "
-            f"{RELATION_PHRASES[command.target_position]} "
-            f"the {DISPLAY_NAMES[command.target_object]}"
-        )
-    return f"{clauses[0].capitalize()}, then {clauses[1]}."
-
-
-def select_tasks(
-    suites: Sequence[str],
-    episodes_per_suite: int,
-    cfg: EvaluationConfig,
-) -> list[EvaluationTask]:
-    if episodes_per_suite <= 0:
-        raise ValueError("episodes_per_suite must be positive")
-
-    selected = []
-    if "independent" in suites:
-        independent = load_independent_tasks(cfg.independent_tasks_path)
-        if episodes_per_suite > len(independent):
-            raise ValueError(
-                f"requested {episodes_per_suite} independent episodes, but only "
-                f"{len(independent)} are available"
-            )
-        selected.extend(independent[:episodes_per_suite])
-    if "chained" in suites:
-        chained = generate_chained_tasks(cfg.chained_task_seed)
-        if episodes_per_suite > len(chained):
-            raise ValueError(
-                f"requested {episodes_per_suite} chained episodes, but only "
-                f"{len(chained)} are available"
-            )
-        selected.extend(chained[:episodes_per_suite])
-    return selected
-
-
-def validate_config(cfg: EvaluationConfig) -> None:
-    positive_values = {
-        "episodes_per_suite": cfg.episodes_per_suite,
-        "max_chunks": cfg.max_chunks,
-        "execution_horizon": cfg.execution_horizon,
-        "relation_tolerance_m": cfg.relation_tolerance_m,
-    }
-    invalid = [name for name, value in positive_values.items() if value <= 0]
-    if invalid:
-        raise ValueError(f"evaluation config values must be positive: {invalid}")
-
-
-def execute_action_steps(
-    sim_env: LabSimMujocoEnv,
-    action_chunk: np.ndarray,
-    *,
-    execution_horizon: int,
-    gripper_threshold: float,
-    viewer: Any,
-    real_time: bool,
-) -> int:
-    action_chunk = np.asarray(action_chunk, dtype=np.float32)
-    if action_chunk.ndim != 2 or action_chunk.shape[1] < 7:
-        raise ValueError(
-            f"expected action chunk with shape (T, >=7), got {action_chunk.shape}"
-        )
-    if not np.all(np.isfinite(action_chunk)):
-        raise ValueError("policy action chunk contains NaN or infinity")
-
-    steps_to_execute = min(execution_horizon, action_chunk.shape[0])
-    sim_env.solver.configuration.update(sim_env.data.qpos.copy())
-    sim_env.solver.reset_target_to_current()
-    next_tick = time.perf_counter()
-    executed_steps = 0
-
-    for action in action_chunk[:steps_to_execute]:
-        if not viewer_is_running(viewer):
-            break
-
-        gripper_closed = bool(float(action[6]) >= gripper_threshold)
-        sim_env.gripper_closed = gripper_closed
-        sim_env.solver.configuration.update(sim_env.data.qpos.copy())
-        sim_env.solver.step(np.asarray(action[:3], dtype=np.float64), scale=1.0)
-        sim_env.sync_ctrl_from_qpos(
-            sim_env.solver.qpos(),
-            sim_env.arm_actuator_ids,
-        )
-        sim_env.data.ctrl[sim_env.gripper_actuator_id] = (
-            sim_env.cfg.gripper_closed_ctrl
-            if gripper_closed
-            else sim_env.cfg.gripper_open_ctrl
-        )
-        sim_env.step_for_duration(sim_env.control_dt)
-
-        if viewer is not None:
-            viewer.sync()
-        if real_time:
-            next_tick += sim_env.control_dt
-            time.sleep(max(0.0, next_tick - time.perf_counter()))
-
-        executed_steps += 1
-
-    return executed_steps
-
-
-def evaluate_episode(
+def evaluate_case(
     client: Any,
-    sim_env: LabSimMujocoEnv,
-    task: EvaluationTask,
+    env: LabSimMujocoEnv,
+    scene: EvaluationScene,
+    case: dict[str, Any],
     cfg: EvaluationConfig,
     *,
     viewer: Any,
-) -> EpisodeResult:
-    client.reset()
-    sim_env.reset()
-    initial_env_info = sim_env.capture_env_info()
+    rtc: bool,
+    rtc_warmup: bool,
+) -> dict[str, Any]:
+    scene.reset(case)
+    initial_env_info = env.capture_env_info()
     chunks = 0
     steps = 0
     termination = "horizon_reached"
-    error: str | None = None
+    error = None
 
     try:
-        for _ in range(cfg.max_chunks):
-            if not viewer_is_running(viewer):
-                termination = "viewer_closed"
-                break
-            action_chunk = client.infer_action_chunk_from_env(
-                sim_env,
-                prompt=task.prompt,
-            )
-            chunks += 1
-            steps += execute_action_steps(
-                sim_env,
-                action_chunk,
-                execution_horizon=cfg.execution_horizon,
-                gripper_threshold=cfg.gripper_threshold,
+        if rtc:
+            chunks, steps, termination = _rollout_rtc(
+                client,
+                env,
+                case["prompt"],
+                cfg,
                 viewer=viewer,
-                real_time=cfg.real_time,
+                warmup=rtc_warmup,
+            )
+        else:
+            chunks, steps, termination = _rollout_standard(
+                client,
+                env,
+                case["prompt"],
+                cfg,
+                viewer=viewer,
             )
     except Exception as exc:
         termination = "error"
         error = f"{type(exc).__name__}: {exc}"
 
-    final_errors = [relation_error(sim_env, command) for command in task.commands]
-    subtask_successes = [
-        error_m <= cfg.relation_tolerance_m for error_m in final_errors
-    ]
+    final_errors = [relation_error(env, command) for command in case["commands"]]
+    successes = [value <= cfg.relation_tolerance_m for value in final_errors]
     subtasks = [
         {
-            "command": asdict(command),
+            "command": command,
             "final_relation_error_m": final_errors[index],
-            "success": subtask_successes[index],
+            "success": successes[index],
         }
-        for index, command in enumerate(task.commands)
+        for index, command in enumerate(case["commands"])
     ]
-    return EpisodeResult(
-        task_id=task.task_id,
-        suite=task.suite,
-        prompt=task.prompt,
-        commands=[asdict(command) for command in task.commands],
-        subtasks=subtasks,
-        subtask_1_success=subtask_successes[0],
-        subtask_2_success=subtask_successes[1],
-        double_stage_success=all(subtask_successes),
-        final_relation_errors_m=final_errors,
-        chunks=chunks,
-        steps=steps,
-        termination=termination,
-        initial_env_info=initial_env_info,
-        final_env_info=sim_env.capture_env_info(),
-        error=error,
+    return {
+        "case_id": case["id"],
+        "suite": case["suite"],
+        "group": case["group"],
+        "distribution": case["distribution"],
+        "comparison_pair": case.get("comparison_pair"),
+        "base_case_id": case.get("base_case_id"),
+        "paired_case_id": case.get("paired_case_id"),
+        "source_task_id": case.get("source_task_id"),
+        "prompt": case["prompt"],
+        "commands": case["commands"],
+        "scene": case["scene"],
+        "subtasks": subtasks,
+        "subtask_1_success": successes[0],
+        "subtask_2_success": successes[1],
+        "double_stage_success": all(successes),
+        "final_relation_errors_m": final_errors,
+        "chunks": chunks,
+        "steps": steps,
+        "termination": termination,
+        "initial_env_info": initial_env_info,
+        "final_env_info": env.capture_env_info(),
+        "error": error,
+    }
+
+
+def _rollout_standard(
+    client: Any,
+    env: LabSimMujocoEnv,
+    prompt: str,
+    cfg: EvaluationConfig,
+    *,
+    viewer: Any,
+) -> tuple[int, int, str]:
+    from inference.client import execute_action_steps
+
+    client.reset()
+    chunks = 0
+    steps = 0
+    for _ in range(cfg.max_chunks):
+        if not viewer_is_running(viewer):
+            return chunks, steps, "viewer_closed"
+        actions = client.infer_action_chunk_from_env(env, prompt=prompt)
+        chunks += 1
+        steps += execute_action_steps(
+            env,
+            actions,
+            execution_horizon=cfg.execution_horizon,
+            gripper_threshold=cfg.gripper_threshold,
+            viewer=viewer,
+            real_time=cfg.real_time,
+        )
+    return chunks, steps, "horizon_reached"
+
+
+def _rollout_rtc(
+    client: Any,
+    env: LabSimMujocoEnv,
+    prompt: str,
+    cfg: EvaluationConfig,
+    *,
+    viewer: Any,
+    warmup: bool,
+) -> tuple[int, int, str]:
+    from inference.client import capture_ur5e_observation
+    from inference.rtc import RTCActionQueue, execute_sim_action
+
+    client.remote.reset()
+    observation = capture_ur5e_observation(env, prompt=prompt)
+    if warmup:
+        initial_actions = client.warmup(
+            observation,
+            num_inferences=cfg.rtc_warmup_inferences,
+        )
+    else:
+        initial_actions = client.seed(observation)
+
+    queue = RTCActionQueue(action_horizon=client.action_horizon)
+    queue.replace(initial_actions)
+    env.sync_solver_to_data()
+
+    completed_chunks = 0
+    next_tick = time.perf_counter()
+    while viewer_is_running(viewer) and completed_chunks < cfg.max_chunks:
+        if client.poll(queue) is not None:
+            completed_chunks += 1
+
+        if completed_chunks < cfg.max_chunks and client.should_request(queue):
+            observation = capture_ur5e_observation(env, prompt=prompt)
+            client.request(observation, queue)
+
+        action = queue.pop()
+        if action is None:
+            env.step_for_duration(env.control_dt)
+        else:
+            execute_sim_action(
+                env,
+                action,
+                gripper_threshold=cfg.gripper_threshold,
+            )
+
+        if viewer is not None:
+            viewer.sync()
+        next_tick += env.control_dt
+        time.sleep(max(0.0, next_tick - time.perf_counter()))
+
+    termination = (
+        "horizon_reached"
+        if completed_chunks >= cfg.max_chunks
+        else "viewer_closed"
     )
+    return completed_chunks, queue.total_control_steps, termination
 
 
-def summarize(results: Iterable[EpisodeResult]) -> dict[str, dict[str, Any]]:
-    grouped: dict[str, list[EpisodeResult]] = {}
-    for result in results:
-        grouped.setdefault(result.suite, []).append(result)
+def summarize(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    rows = list(results)
+    suites = sorted({row["suite"] for row in rows})
+    return {
+        "overall": _metrics(rows),
+        "by_suite": {
+            suite: _metrics([row for row in rows if row["suite"] == suite])
+            for suite in suites
+        },
+        "by_group": {
+            suite: {
+                group: _metrics(
+                    [
+                        row
+                        for row in rows
+                        if row["suite"] == suite and row["group"] == group
+                    ]
+                )
+                for group in sorted(
+                    {
+                        row["group"]
+                        for row in rows
+                        if row["suite"] == suite
+                    }
+                )
+            }
+            for suite in suites
+        },
+        "by_distribution": {
+            suite: {
+                group: {
+                    distribution: _metrics(
+                        [
+                            row
+                            for row in rows
+                            if row["suite"] == suite
+                            and row["group"] == group
+                            and row["distribution"] == distribution
+                        ]
+                    )
+                    for distribution in sorted(
+                        {
+                            row["distribution"]
+                            for row in rows
+                            if row["suite"] == suite and row["group"] == group
+                        }
+                    )
+                }
+                for group in sorted(
+                    {row["group"] for row in rows if row["suite"] == suite}
+                )
+            }
+            for suite in suites
+        },
+    }
 
-    summaries = {}
-    for suite, suite_results in grouped.items():
-        episode_count = len(suite_results)
-        summaries[suite] = {
-            "episodes": episode_count,
-            "completed_without_error": sum(result.error is None for result in suite_results),
-            "subtask_1_success_rate": _mean_bool(
-                result.subtask_1_success for result in suite_results
-            ),
-            "subtask_2_success_rate": _mean_bool(
-                result.subtask_2_success for result in suite_results
-            ),
-            "double_stage_success_rate": _mean_bool(
-                result.double_stage_success for result in suite_results
-            ),
-        }
-        if suite == "chained":
-            summaries[suite]["chained_task_success_rate"] = summaries[suite][
-                "double_stage_success_rate"
-            ]
-    return summaries
+
+def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    count = len(rows)
+    return {
+        "episodes": count,
+        "completed_without_error": sum(row["error"] is None for row in rows),
+        "subtask_1_success_rate": _rate(
+            row["subtask_1_success"] for row in rows
+        ),
+        "subtask_2_success_rate": _rate(
+            row["subtask_2_success"] for row in rows
+        ),
+        "double_stage_success_rate": _rate(
+            row["double_stage_success"] for row in rows
+        ),
+    }
 
 
-def _mean_bool(values: Iterable[bool]) -> float:
+def _rate(values: Iterable[bool]) -> float:
     items = list(values)
-    return 0.0 if not items else sum(items) / len(items)
+    return sum(items) / len(items) if items else 0.0
 
 
 def write_report(
-    path: Path,
     cfg: EvaluationConfig,
-    results: Sequence[EpisodeResult],
+    results: list[dict[str, Any]],
+    *,
+    mode: str,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    config = asdict(cfg)
+    for key, value in config.items():
+        if isinstance(value, Path):
+            config[key] = str(value)
     payload = {
-        "config": _jsonable_config(cfg),
+        "mode": mode,
+        "cases_path": str(cfg.cases_path),
+        "config": config,
         "summary": summarize(results),
-        "episodes": [asdict(result) for result in results],
+        "episodes": results,
     }
-    path.write_text(
+    cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.output_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
 
 
-def _jsonable_config(cfg: EvaluationConfig) -> dict[str, Any]:
-    result = asdict(cfg)
-    for key, value in tuple(result.items()):
-        if isinstance(value, Path):
-            result[key] = str(value)
-    return result
-
-
-def print_summary(summary: dict[str, dict[str, Any]]) -> None:
+def print_summary(summary: dict[str, Any]) -> None:
     print("\nEvaluation summary")
-    for suite, metrics in summary.items():
-        print(f"[{suite}] episodes={metrics['episodes']}")
-        for key in (
-            "subtask_1_success_rate",
-            "subtask_2_success_rate",
-            "double_stage_success_rate",
-        ):
-            print(f"  {key}: {_format_rate(metrics[key])}")
-
-
-def _format_rate(value: float | None) -> str:
-    return "N/A" if value is None else f"{100.0 * value:.2f}%"
+    for suite, metrics in summary["by_suite"].items():
+        print(
+            f"[{suite}] n={metrics['episodes']} "
+            f"stage1={metrics['subtask_1_success_rate']:.1%} "
+            f"stage2={metrics['subtask_2_success_rate']:.1%} "
+            f"double={metrics['double_stage_success_rate']:.1%}"
+        )
+        for group, group_metrics in summary["by_group"][suite].items():
+            print(
+                f"  {group}: n={group_metrics['episodes']}, "
+                f"double={group_metrics['double_stage_success_rate']:.1%}"
+            )
+            distributions = summary["by_distribution"][suite][group]
+            if len(distributions) > 1:
+                for distribution, distribution_metrics in distributions.items():
+                    print(
+                        f"    {distribution}: "
+                        f"n={distribution_metrics['episodes']}, "
+                        f"double="
+                        f"{distribution_metrics['double_stage_success_rate']:.1%}"
+                    )
 
 
 def parse_args() -> argparse.Namespace:
     defaults = EvaluationConfig()
     parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate independent A->B/C->D and chained A->B/C->A policy tasks."
-        )
+        description="Evaluate fixed 60+60 A->B/C->D and A->B/C->A suites."
     )
     parser.add_argument(
         "--suite",
         choices=("all", "independent", "chained"),
         default="all",
     )
-    parser.add_argument(
-        "--episodes-per-suite",
-        type=int,
-        default=defaults.episodes_per_suite,
-    )
-    parser.add_argument(
-        "--independent-tasks",
-        type=Path,
-        default=defaults.independent_tasks_path,
-    )
+    parser.add_argument("--rtc", action="store_true", help="Use real-time chunking.")
     parser.add_argument("--host", default=defaults.policy_host)
     parser.add_argument("--port", type=int, default=defaults.policy_port)
+    parser.add_argument("--source-tasks", type=Path, default=defaults.source_tasks_path)
+    parser.add_argument("--cases", type=Path, default=defaults.cases_path)
+    parser.add_argument("--output", type=Path, default=defaults.output_path)
+    parser.add_argument("--seed", type=int, default=defaults.task_seed)
     parser.add_argument("--max-chunks", type=int, default=defaults.max_chunks)
     parser.add_argument(
         "--execution-horizon",
         type=int,
         default=defaults.execution_horizon,
     )
-    parser.add_argument("--output", type=Path, default=defaults.output_path)
-    parser.add_argument("--seed", type=int, default=defaults.reset_random_seed)
     parser.add_argument(
-        "--show-viewer",
-        action="store_true",
-        help="Show the MuJoCo viewer instead of evaluating headlessly.",
+        "--tolerance-cm",
+        type=float,
+        default=100.0 * defaults.relation_tolerance_m,
     )
+    parser.add_argument(
+        "--rtc-warmup-inferences",
+        type=int,
+        default=defaults.rtc_warmup_inferences,
+    )
+    parser.add_argument(
+        "--regenerate-cases",
+        action="store_true",
+        help="Overwrite the persisted cases JSON using the configured seed.",
+    )
+    parser.add_argument(
+        "--list-cases",
+        action="store_true",
+        help="Create/load and print cases without connecting to the policy server.",
+    )
+    parser.add_argument("--show-viewer", action="store_true")
     parser.add_argument(
         "--real-time",
         action="store_true",
-        help="Sleep between control steps to match the configured FPS.",
-    )
-    parser.add_argument(
-        "--list-tasks",
-        action="store_true",
-        help="Print selected task prompts without connecting to the policy server.",
+        help="Run standard chunking at simulation FPS; RTC is always real-time.",
     )
     return parser.parse_args()
 
@@ -510,65 +379,121 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     defaults = EvaluationConfig()
-    suites = defaults.suites if args.suite == "all" else (args.suite,)
     cfg = replace(
         defaults,
         policy_host=args.host,
         policy_port=args.port,
-        suites=suites,
-        episodes_per_suite=args.episodes_per_suite,
-        independent_tasks_path=args.independent_tasks,
+        source_tasks_path=args.source_tasks,
+        cases_path=args.cases,
         output_path=args.output,
+        task_seed=args.seed,
         max_chunks=args.max_chunks,
         execution_horizon=args.execution_horizon,
+        relation_tolerance_m=args.tolerance_cm / 100.0,
+        rtc_warmup_inferences=args.rtc_warmup_inferences,
         headless=not args.show_viewer,
         real_time=args.real_time,
-        reset_random_seed=args.seed,
     )
-    validate_config(cfg)
-    tasks = select_tasks(cfg.suites, cfg.episodes_per_suite, cfg)
-
-    if args.list_tasks:
-        for task in tasks:
-            print(f"{task.task_id} [{task.suite}] {task.prompt}")
-        return
-
-    # Imported only for an actual rollout so task generation and final-relation
-    # tests do not require the lightweight openpi client package globally.
-    from inference.client import RemoteUR5EInferenceClient
-
     record_cfg = replace(
         RecordConfig(),
-        reset_random_seed=cfg.reset_random_seed,
+        reset_random_seed=cfg.task_seed,
+        spatial_episode_rd_enabled=False,
+        spatial_frame_rd_enabled=False,
+        appearance_rd_enabled=False,
     )
-    client = RemoteUR5EInferenceClient(
-        host=cfg.policy_host,
-        port=cfg.policy_port,
-        image_size=record_cfg.image_size,
-    )
-    sim_env = LabSimMujocoEnv(record_cfg)
-    results: list[EpisodeResult] = []
-    try:
-        with sim_env.viewer_context(headless=cfg.headless) as viewer:
-            for index, task in enumerate(tasks, start=1):
-                print(f"[{index}/{len(tasks)}] {task.task_id}: {task.prompt}")
-                result = evaluate_episode(client, sim_env, task, cfg, viewer=viewer)
-                results.append(result)
-                write_report(cfg.output_path, cfg, results)
-                print(
-                    f"  stage1={result.subtask_1_success} "
-                    f"stage2={result.subtask_2_success} "
-                    f"double={result.double_stage_success} "
-                    f"termination={result.termination}"
-                )
-                if not viewer_is_running(viewer):
-                    break
-    finally:
-        sim_env.close()
 
-    summary = summarize(results)
-    print_summary(summary)
-    print(f"Report: {cfg.output_path}")
+    env = LabSimMujocoEnv(record_cfg)
+    try:
+        payload = load_or_create_cases(
+            cfg,
+            record_cfg,
+            env.sample_reset_object_poses,
+            regenerate=args.regenerate_cases,
+        )
+        print(f"Evaluation cases ready: {cfg.cases_path}")
+        cases = [
+            case
+            for case in payload["cases"]
+            if args.suite == "all" or case["suite"] == args.suite
+        ]
+
+        if args.list_cases:
+            for case in cases:
+                changes = ", ".join(case["scene"]) or "nominal"
+                print(
+                    f"{case['id']} [{case['group']}; "
+                    f"{case['distribution']}; {changes}] "
+                    f"{case['prompt']}"
+                )
+            return
+
+        from inference.client import RemoteUR5EInferenceClient
+
+        if args.rtc:
+            from inference.rtc import RTCRemoteClient
+
+            remote = RemoteUR5EInferenceClient(
+                host=cfg.policy_host,
+                port=cfg.policy_port,
+                image_size=record_cfg.image_size,
+                timeout_s=cfg.rtc_network_timeout_s,
+            )
+            client = RTCRemoteClient(
+                remote,
+                fps=record_cfg.fps,
+                queue_threshold=cfg.rtc_queue_threshold,
+            )
+            mode = "rtc"
+        else:
+            client = RemoteUR5EInferenceClient(
+                host=cfg.policy_host,
+                port=cfg.policy_port,
+                image_size=record_cfg.image_size,
+                timeout_s=cfg.network_timeout_s,
+            )
+            mode = "standard"
+
+        results: list[dict[str, Any]] = []
+        rtc_warmed = False
+        scene = EvaluationScene(env)
+        try:
+            with env.viewer_context(headless=cfg.headless) as viewer:
+                for index, case in enumerate(cases, start=1):
+                    print(f"[{index}/{len(cases)}] {case['id']}: {case['prompt']}")
+                    result = evaluate_case(
+                        client,
+                        env,
+                        scene,
+                        case,
+                        cfg,
+                        viewer=viewer,
+                        rtc=args.rtc,
+                        rtc_warmup=not rtc_warmed,
+                    )
+                    if args.rtc:
+                        rtc_warmed = True
+                    results.append(result)
+                    write_report(cfg, results, mode=mode)
+                    print(
+                        f"  stage1={result['subtask_1_success']} "
+                        f"stage2={result['subtask_2_success']} "
+                        f"double={result['double_stage_success']} "
+                        f"termination={result['termination']}"
+                    )
+                    if result["error"]:
+                        print(f"  error={result['error']}")
+                    if not viewer_is_running(viewer) or (
+                        args.rtc and result["error"]
+                    ):
+                        break
+        finally:
+            client.close()
+
+        summary = summarize(results)
+        print_summary(summary)
+        print(f"Report: {cfg.output_path}")
+    finally:
+        env.close()
 
 
 if __name__ == "__main__":
